@@ -1,0 +1,19 @@
+# Large model files
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Output
+output/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Logs
+*.log
+tensorboard/
+wandb/
+
+# System
+.DS_Store

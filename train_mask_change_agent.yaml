@@ -1,0 +1,41 @@
+# DeltaVLM CD Branch Training Config
+# Architecture: Change-Agent BI3/GDFA/CBF + multi-scale ViT skip connections
+# Reference: https://github.com/Chen-Yang-Liu/Change-Agent
+
+# Data
+data_root: /root/autodl-tmp/LEVIR-MCI-dataset/images
+mask_root: null
+
+# Model
+pretrained: ./checkpoint_best.pth
+mask_decoder_type: change_agent
+
+# CD architecture
+mask_hidden_dim: 512
+num_bi3_layers: 3
+num_heads: 8
+mlp_ratio: 4.0
+
+# Multi-scale ViT feature tapping (EVA-ViT-G: 39 blocks, 0-indexed)
+multiscale_layers: [9, 19, 29, 38]
+
+# Output
+mask_num_stages: 4
+mask_size: 256
+image_size: 224
+
+# Training
+epochs: 100
+batch_size: 8
+lr: 5.0e-5
+weight_decay: 0.01
+warmup_epochs: 5
+min_lr: 1.0e-6
+
+# Misc
+output_dir: ./output/mask_branch_change_agent
+seed: 42
+num_workers: 4
+log_freq: 50
+save_freq: 5
+eval_freq: 1
