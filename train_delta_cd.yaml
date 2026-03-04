@@ -1,0 +1,44 @@
+# DeltaCD Training Config
+# Architecture: EVA-ViT (frozen) + HR Encoder → Fusion → CSRM → MaskDecoder
+
+data_root: /root/autodl-tmp/LEVIR-MCI-dataset/images
+mask_root: null
+pretrained: ./checkpoint_best.pth
+
+# Decoder type: delta_cd (new) or change_agent (legacy)
+mask_decoder_type: delta_cd
+
+# DeltaCD architecture
+sem_dim: 256
+hr_mid_dim: 48
+hr_out_dim: 96
+fused_dim: 256
+fusion_size: 56
+
+# Output
+mask_size: 256
+image_size: 224
+num_classes: 3
+
+# These are for legacy compat (unused by delta_cd)
+mask_hidden_dim: 256
+mask_num_stages: 4
+
+# Training
+epochs: 100
+batch_size: 8
+lr: 2.0e-04
+weight_decay: 0.01
+warmup_epochs: 5
+min_lr: 1.0e-06
+
+# No background filtering — all samples participate
+filter_no_change: false
+
+# Output & logging
+output_dir: ./output/delta_cd
+seed: 42
+num_workers: 4
+log_freq: 50
+save_freq: 25
+eval_freq: 1

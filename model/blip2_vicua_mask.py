@@ -3,16 +3,13 @@ DeltaVLM with Mask Branch
 
 Extends Blip2VicunaInstruct with a mask prediction branch for change detection.
 
-Uses Change-Agent style architecture: BI3/GDFA/CBF based CD module.
+Supports two decoder backends:
+  - "delta_cd": Clean dual-path (semantic+HR) with CSRM in fused space (recommended)
+  - "change_agent": Legacy BI3/GDFA/CBF based CD module
 
 Training Strategy:
 - Freeze: Visual Encoder, CSRM, Q-Former, LLM
-- Train: Mask Branch only (ChangeAgentCD)
-
-Change-Agent Reference:
-- Paper: "Change-Agent: Toward Interactive Comprehensive Remote Sensing
-         Change Interpretation and Analysis"
-- GitHub: https://github.com/Chen-Yang-Liu/Change-Agent
+- Train: Mask Branch only
 """
 
 import logging
@@ -24,14 +21,16 @@ from torch.cuda.amp import autocast as autocast
 
 from model.blip2_vicua import Blip2VicunaInstruct
 from model.mask_branch.change_agent_cd import ChangeAgentCD
+from model.mask_branch.delta_cd import DeltaCD
 
 
 class Blip2VicunaMask(Blip2VicunaInstruct):
     """
     DeltaVLM with Mask Prediction Branch.
 
-    Adds a Change-Agent style CD branch after the visual encoder.
-    Supports multi-scale ViT feature extraction for HR decoding.
+    Supports two decoder types:
+      - "delta_cd": Dual-path (semantic adapter + HR encoder) → fusion → CSRM → mask
+      - "change_agent": Legacy BI3/GDFA/CBF pipeline
     """
 
     def __init__(
@@ -58,11 +57,19 @@ class Blip2VicunaMask(Blip2VicunaInstruct):
         num_bi3_layers=3,
         num_heads=8,
         mlp_ratio=4.0,
-        # Multi-scale ViT feature tapping points (0-indexed block indices)
-        # EVA-ViT-G has 39 blocks; default taps at 1/4, 1/2, 3/4, final
         multiscale_layers=None,
-        # Legacy compat
+        num_classes=3,
+        # HR branch (legacy change_agent)
+        use_hr_branch=False,
+        hr_dims=(64, 128, 256),
+        # Decoder backend selection
         mask_decoder_type="change_agent",
+        # DeltaCD-specific
+        sem_dim=256,
+        hr_mid_dim=48,
+        hr_out_dim=96,
+        fused_dim=256,
+        fusion_size=56,
     ):
         if mask_training_mode:
             self._skip_llm = True
@@ -86,27 +93,49 @@ class Blip2VicunaMask(Blip2VicunaInstruct):
         self.enable_mask_branch = enable_mask_branch
         self.freeze_for_mask_training = freeze_for_mask_training
         self.mask_training_mode = mask_training_mode
+        self.mask_decoder_type = mask_decoder_type
+        self.use_hr_branch = use_hr_branch
         self.multiscale_layers = multiscale_layers or [9, 19, 29, 38]
 
         if enable_mask_branch:
             eva_dim = self.visual_encoder.num_features  # 1408
-            self.mask_decoder = ChangeAgentCD(
-                eva_dim=eva_dim,
-                hidden_dim=mask_hidden_dim,
-                num_bi3_layers=num_bi3_layers,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                num_classes=1,
-                num_upsample_stages=mask_num_stages,
-                output_size=mask_output_size,
-                dropout=0.1,
-                multiscale_dims=[eva_dim] * len(self.multiscale_layers),
-            )
-            logging.info(
-                f"CD branch: hidden_dim={mask_hidden_dim}, "
-                f"bi3_layers={num_bi3_layers}, heads={num_heads}, "
-                f"ms_layers={self.multiscale_layers}"
-            )
+
+            if mask_decoder_type == "delta_cd":
+                self.mask_decoder = DeltaCD(
+                    vit_dim=eva_dim,
+                    sem_dim=sem_dim,
+                    hr_mid_dim=hr_mid_dim,
+                    hr_out_dim=hr_out_dim,
+                    fused_dim=fused_dim,
+                    fusion_size=fusion_size,
+                    num_classes=num_classes,
+                    output_size=mask_output_size,
+                )
+                n_params = sum(p.numel() for p in self.mask_decoder.parameters())
+                logging.info(
+                    f"DeltaCD: sem_dim={sem_dim}, hr_out={hr_out_dim}, "
+                    f"fused={fused_dim}, fusion@{fusion_size}x{fusion_size}, "
+                    f"classes={num_classes}, params={n_params:,}"
+                )
+            else:
+                cd_kwargs = dict(
+                    eva_dim=eva_dim,
+                    hidden_dim=mask_hidden_dim,
+                    num_bi3_layers=num_bi3_layers,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    num_classes=num_classes,
+                    num_upsample_stages=mask_num_stages,
+                    output_size=mask_output_size,
+                    dropout=0.1,
+                )
+                if use_hr_branch:
+                    cd_kwargs['use_hr_branch'] = True
+                    cd_kwargs['hr_dims'] = tuple(hr_dims) if not isinstance(hr_dims, tuple) else hr_dims
+                else:
+                    cd_kwargs['multiscale_dims'] = [eva_dim] * len(self.multiscale_layers)
+                self.mask_decoder = ChangeAgentCD(**cd_kwargs)
+                logging.info(f"ChangeAgentCD: hidden_dim={mask_hidden_dim}")
 
             if freeze_for_mask_training:
                 self._freeze_for_mask_training()
@@ -223,29 +252,35 @@ class Blip2VicunaMask(Blip2VicunaInstruct):
         image_A: torch.Tensor,
         image_B: torch.Tensor,
         gt_mask: Optional[torch.Tensor] = None,
-        use_multiscale: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for mask prediction only.
 
         Args:
             image_A/B: (B, 3, H, W)
-            gt_mask: (B, 1, H, W) optional
-            use_multiscale: use multi-level ViT features for HR decoding
+            gt_mask: (B, H, W) long for multi-class
         """
         if not self.enable_mask_branch:
             raise RuntimeError("Mask branch not enabled")
 
-        if use_multiscale:
+        if self.mask_decoder_type == "delta_cd":
+            feat_bef, feat_aft = self.extract_visual_features(image_A, image_B)
+            return self.mask_decoder(
+                feat_bef, feat_aft, image_A, image_B, gt_mask=gt_mask,
+            )
+        elif self.use_hr_branch:
+            feat_bef, feat_aft = self.extract_visual_features(image_A, image_B)
+            return self.mask_decoder(
+                feat_bef, feat_aft, gt_mask=gt_mask,
+                img_bef=image_A, img_aft=image_B,
+            )
+        else:
             feat_bef, feat_aft, ms_bef, ms_aft = \
                 self.extract_multiscale_features(image_A, image_B)
             return self.mask_decoder(
                 feat_bef, feat_aft, gt_mask=gt_mask,
                 ms_feats_bef=ms_bef, ms_feats_aft=ms_aft,
             )
-        else:
-            feat_bef, feat_aft = self.extract_visual_features(image_A, image_B)
-            return self.mask_decoder(feat_bef, feat_aft, gt_mask=gt_mask)
 
     def forward(self, samples, return_mask=False):
         """Forward pass supporting both captioning and mask prediction."""
@@ -271,16 +306,29 @@ class Blip2VicunaMask(Blip2VicunaInstruct):
         image_B: torch.Tensor,
         threshold: float = 0.5,
     ) -> torch.Tensor:
-        """Inference-only mask prediction with multi-scale features."""
+        """Inference-only mask prediction."""
         if not self.enable_mask_branch:
             raise RuntimeError("Mask branch not enabled")
         with torch.no_grad():
-            feat_bef, feat_aft, ms_bef, ms_aft = \
-                self.extract_multiscale_features(image_A, image_B)
-            return self.mask_decoder.predict(
-                feat_bef, feat_aft, threshold=threshold,
-                ms_feats_bef=ms_bef, ms_feats_aft=ms_aft,
-            )
+            if self.mask_decoder_type == "delta_cd":
+                feat_bef, feat_aft = self.extract_visual_features(image_A, image_B)
+                return self.mask_decoder.predict(
+                    feat_bef, feat_aft, image_A, image_B,
+                    threshold=threshold,
+                )
+            elif self.use_hr_branch:
+                feat_bef, feat_aft = self.extract_visual_features(image_A, image_B)
+                return self.mask_decoder.predict(
+                    feat_bef, feat_aft, threshold=threshold,
+                    img_bef=image_A, img_aft=image_B,
+                )
+            else:
+                feat_bef, feat_aft, ms_bef, ms_aft = \
+                    self.extract_multiscale_features(image_A, image_B)
+                return self.mask_decoder.predict(
+                    feat_bef, feat_aft, threshold=threshold,
+                    ms_feats_bef=ms_bef, ms_feats_aft=ms_aft,
+                )
 
     # ------------------------------------------------------------------
     # Serialization
@@ -304,6 +352,9 @@ class Blip2VicunaMask(Blip2VicunaInstruct):
             'num_heads': 8,
             'mlp_ratio': 4.0,
             'multiscale_layers': [9, 19, 29, 38],
+            'use_hr_branch': False,
+            'hr_dims': (64, 128, 256),
+            'mask_decoder_type': 'change_agent',
         }
         config.update(kwargs)
 
@@ -371,6 +422,12 @@ def build_model(cfg):
         num_heads=cfg.get("num_heads", 8),
         mlp_ratio=cfg.get("mlp_ratio", 4.0),
         multiscale_layers=cfg.get("multiscale_layers", [9, 19, 29, 38]),
+        mask_decoder_type=cfg.get("mask_decoder_type", "change_agent"),
+        sem_dim=cfg.get("sem_dim", 256),
+        hr_mid_dim=cfg.get("hr_mid_dim", 48),
+        hr_out_dim=cfg.get("hr_out_dim", 96),
+        fused_dim=cfg.get("fused_dim", 256),
+        fusion_size=cfg.get("fusion_size", 56),
     )
 
     pretrained = cfg.get("pretrained", None)
