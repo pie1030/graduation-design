@@ -1,32 +1,67 @@
 """
-DeltaCD: Clean Change Detection Module for DeltaVLM
+DeltaCD v2: Multi-scale Change Detection aligned with Change-Agent pipeline.
 
-Architecture:
-  Path 1 (frozen): EVA-ViT → semantic features (16x16, 1408d)
-  Path 2 (trainable): Lightweight HR Encoder → spatial detail features (56x56)
-  Fusion: Upsample semantic + HR → fused features (56x56)
-  CSRM: Difference-gated features in fused high-resolution space
-  MaskDecoder: concat(F_A', diff, F_B') → mask (256x256)
+Key design (following Change-Agent's proven architecture):
+  Path 1 (frozen): EVA-ViT → semantic features injected at deepest scale
+  Path 2 (trainable): Pretrained ResNet-18 → multi-scale spatial features (56/28/14)
+  Multi-scale difference fusion (Change-Agent pattern): conv_dif + cos_sim + conv_fuse
+  FPN top-down decoder: progressive upsample with skip addition
+  CSRM: applied at deepest scale for semantic-aware difference gating
 
-Key design principles:
-  - HR is not a skip connection; it fuses as an equal partner with semantic features
-  - Difference modeling happens in the fused high-resolution space
-  - CSRM provides per-position gating for change-aware feature selection
-  - Clean gradient path: all trainable components receive direct gradients
+Reference: Change-Agent (Chen-Yang-Liu, TGRS 2024)
+  https://github.com/Chen-Yang-Liu/Change-Agent
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
-from .mask_head import MultiClassFocalDiceLoss, FocalDiceLoss
 
+# ---------------------------------------------------------------------------
+# HR Encoder: Pretrained ResNet-18 (Siamese, shared for A and B)
+# ---------------------------------------------------------------------------
+
+class HRResNet18(nn.Module):
+    """
+    Pretrained ResNet-18 as multi-scale spatial feature extractor.
+
+    Outputs features at 3 scales:
+      layer1: (64,  56, 56)   — fine spatial detail
+      layer2: (128, 28, 28)   — medium detail
+      layer3: (256, 14, 14)   — coarse + some semantics
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+        resnet = models.resnet18(
+            weights=models.ResNet18_Weights.DEFAULT if pretrained else None,
+        )
+        self.stem = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+        )
+        self.layer1 = resnet.layer1   # (64, 56, 56)
+        self.layer2 = resnet.layer2   # (128, 28, 28)
+        self.layer3 = resnet.layer3   # (256, 14, 14)
+
+    def forward(self, x):
+        """(B, 3, 224, 224) → list of [(64, 56), (128, 28), (256, 14)]"""
+        x = self.stem(x)
+        f1 = self.layer1(x)   # (B, 64, 56, 56)
+        f2 = self.layer2(f1)  # (B, 128, 28, 28)
+        f3 = self.layer3(f2)  # (B, 256, 14, 14)
+        return [f1, f2, f3]
+
+
+# ---------------------------------------------------------------------------
+# Semantic Adapter: EVA-ViT → spatial features matching ResNet deepest scale
+# ---------------------------------------------------------------------------
 
 class SemanticAdapter(nn.Module):
-    """Adapts frozen EVA-ViT output (B, 257, 1408) → spatial features (B, C, H, H)."""
+    """Adapt EVA-ViT (B, 257, 1408) → (B, 256, 14, 14) matching ResNet layer3."""
 
-    def __init__(self, vit_dim=1408, out_dim=256, target_size=56):
+    def __init__(self, vit_dim=1408, out_dim=256, target_size=14):
         super().__init__()
         self.target_size = target_size
         self.proj = nn.Sequential(
@@ -36,93 +71,28 @@ class SemanticAdapter(nn.Module):
         self.refine = nn.Sequential(
             nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_dim),
-            nn.GELU(),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.GELU(),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        """(B, 257, 1408) → (B, out_dim, target_size, target_size)"""
         B = x.shape[0]
-        x = x[:, 1:, :]  # drop CLS token → (B, 256, 1408)
+        x = x[:, 1:, :]  # drop CLS → (B, 256, 1408)
         x = self.proj(x)  # (B, 256, out_dim)
         H = W = int(math.sqrt(x.shape[1]))  # 16
-        x = x.transpose(1, 2).reshape(B, -1, H, W)  # (B, out_dim, 16, 16)
-        x = F.interpolate(
-            x, size=(self.target_size, self.target_size),
-            mode='bilinear', align_corners=False,
-        )
-        x = x + self.refine(x)  # residual refinement
+        x = x.transpose(1, 2).reshape(B, -1, H, W)
+        x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+        x = self.refine(x)
         return x
 
 
-class HREncoder(nn.Module):
-    """
-    Lightweight CNN for high-resolution spatial feature extraction.
-    Siamese (shared weights for both temporal images).
-
-    224x224 → stem(s=2) → 112x112 → stage1(s=2) → 56x56
-    """
-
-    def __init__(self, in_channels=3, mid_dim=48, out_dim=96):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, mid_dim, 7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(mid_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(mid_dim, out_dim, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-        self.downsample = nn.Sequential(
-            nn.Conv2d(mid_dim, out_dim, 1, stride=2, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        """(B, 3, 224, 224) → (B, out_dim, 56, 56)"""
-        x = self.stem(x)              # (B, 48, 112, 112)
-        identity = self.downsample(x)  # (B, out_dim, 56, 56)
-        x = self.stage1(x)            # (B, out_dim, 56, 56)
-        return self.relu(x + identity)
-
-
-class FusionModule(nn.Module):
-    """Fuses upsampled semantic features and HR spatial features."""
-
-    def __init__(self, sem_dim=256, hr_dim=96, out_dim=256):
-        super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Conv2d(sem_dim + hr_dim, out_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.GELU(),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.GELU(),
-        )
-
-    def forward(self, sem_feat, hr_feat):
-        return self.fuse(torch.cat([sem_feat, hr_feat], dim=1))
-
+# ---------------------------------------------------------------------------
+# CSRM: applied at deepest fused scale for semantic-aware gating
+# ---------------------------------------------------------------------------
 
 class SpatialCSRM(nn.Module):
     """
-    Cross-temporal Spatial Reasoning Module in fused feature space.
-
-    For each spatial position independently:
-      diff = B - A
-      C_A = tanh(W_cd · diff + W_cf · A)      (context)
-      G_A = sigmoid(W_gd · diff + W_gf · A)    (gate)
-      F_A' = G_A * C_A                          (gated output)
-    Symmetric for B.
-
-    Operates on (B, C, H, W) spatial features via per-position linear layers.
+    Cross-temporal Spatial Reasoning Module.
+    Applied per-position: diff = B - A, then gate + context for each.
     """
 
     def __init__(self, dim):
@@ -133,224 +103,203 @@ class SpatialCSRM(nn.Module):
         self.gate_feat = nn.Linear(dim, dim)
 
     def forward(self, feat_A, feat_B):
-        """
-        Args:
-            feat_A, feat_B: (B, C, H, W) fused features
-        Returns:
-            F_A': gated feature for A  (B, C, H, W)
-            F_B': gated feature for B  (B, C, H, W)
-            diff: difference feature    (B, C, H, W)
-        """
         B, C, H, W = feat_A.shape
-
-        # Flatten spatial dims for linear layers: (B, H*W, C)
         a = feat_A.flatten(2).transpose(1, 2)
         b = feat_B.flatten(2).transpose(1, 2)
         diff = b - a
 
-        # Gate and context for A
         ctx_a = torch.tanh(self.context_diff(diff) + self.context_feat(a))
         gate_a = torch.sigmoid(self.gate_diff(diff) + self.gate_feat(a))
-        fa_prime = gate_a * ctx_a
+        fa = gate_a * ctx_a
 
-        # Gate and context for B
         ctx_b = torch.tanh(self.context_diff(diff) + self.context_feat(b))
         gate_b = torch.sigmoid(self.gate_diff(diff) + self.gate_feat(b))
-        fb_prime = gate_b * ctx_b
+        fb = gate_b * ctx_b
 
-        # Reshape back to spatial
-        fa_prime = fa_prime.transpose(1, 2).reshape(B, C, H, W)
-        fb_prime = fb_prime.transpose(1, 2).reshape(B, C, H, W)
-        diff_out = diff.transpose(1, 2).reshape(B, C, H, W)
-
-        return fa_prime, fb_prime, diff_out
+        fa = fa.transpose(1, 2).reshape(B, C, H, W)
+        fb = fb.transpose(1, 2).reshape(B, C, H, W)
+        return fa, fb
 
 
-class MaskDecoder(nn.Module):
-    """
-    Progressive upsampling decoder: (3*C, 56, 56) → (num_classes, 256, 256).
-
-    Input: concat(F_A', diff, F_B') from CSRM.
-    Two ConvTranspose2d stages (56→112→224), then interpolate to 256.
-    """
-
-    def __init__(self, in_dim, num_classes=3, output_size=(256, 256)):
-        super().__init__()
-        self.output_size = output_size
-
-        self.compress = nn.Sequential(
-            nn.Conv2d(in_dim, 256, 3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.GELU(),
-        )
-
-        # 56 → 112
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-        )
-
-        # 112 → 224
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.Conv2d(64, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-        )
-
-        self.head = nn.Conv2d(64, num_classes, 1)
-
-    def forward(self, x):
-        """(B, in_dim, 56, 56) → (B, num_classes, 256, 256)"""
-        x = self.compress(x)  # (B, 256, 56, 56)
-        x = self.up1(x)       # (B, 128, 112, 112)
-        x = self.up2(x)       # (B, 64, 224, 224)
-        x = self.head(x)      # (B, num_classes, 224, 224)
-        if x.shape[-2:] != tuple(self.output_size):
-            x = F.interpolate(
-                x, size=self.output_size,
-                mode='bilinear', align_corners=False,
-            )
-        return x
-
+# ---------------------------------------------------------------------------
+# DeltaCD v2: Complete module
+# ---------------------------------------------------------------------------
 
 class DeltaCD(nn.Module):
     """
-    Complete Change Detection module for DeltaVLM.
+    Multi-scale Change Detection following Change-Agent's CD pipeline.
 
-    Pipeline (per image pair):
-      1. SemanticAdapter: EVA-ViT (frozen) feat → upsample to 56x56
-      2. HREncoder: raw image → spatial detail at 56x56
-      3. Fusion: concat semantic + HR → fused features
-      4. SpatialCSRM: difference-gated features in fused space
-      5. MaskDecoder: concat(F_A', diff, F_B') → class mask at 256x256
-
-    Trainable parameters: ~3.5M (vs ~50M in old ChangeAgentCD)
+    Architecture:
+      1. HRResNet18 (pretrained, trainable) → multi-scale features [56, 28, 14]
+      2. SemanticAdapter: EVA-ViT → (256, 14, 14), injected at deepest scale
+      3. CSRM at deepest scale for semantic-aware gating
+      4. Multi-scale diff fusion (Change-Agent pattern) at each scale
+      5. FPN top-down decoder → segmentation head
+      6. CrossEntropyLoss (matching Change-Agent)
     """
+
+    DIMS = [64, 128, 256]  # ResNet-18 layer1/2/3 channels
 
     def __init__(
         self,
         vit_dim=1408,
-        sem_dim=256,
-        hr_mid_dim=48,
-        hr_out_dim=96,
-        fused_dim=256,
-        fusion_size=56,
         num_classes=3,
         output_size=(256, 256),
+        pretrained_hr=True,
+        # Legacy compat args (ignored)
+        **kwargs,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.output_size = output_size
+        dims = self.DIMS
 
-        # Path 1: Semantic adapter (ViT tokens → spatial)
-        self.sem_adapter = SemanticAdapter(vit_dim, sem_dim, fusion_size)
+        # --- Encoders ---
+        self.hr_encoder = HRResNet18(pretrained=pretrained_hr)
+        self.sem_adapter = SemanticAdapter(vit_dim, out_dim=dims[-1], target_size=14)
 
-        # Path 2: HR spatial encoder
-        self.hr_encoder = HREncoder(
-            in_channels=3, mid_dim=hr_mid_dim, out_dim=hr_out_dim,
+        # Inject ViT semantics into deepest HR scale
+        self.sem_inject = nn.Sequential(
+            nn.Conv2d(dims[-1] * 2, dims[-1], 3, padding=1, bias=False),
+            nn.BatchNorm2d(dims[-1]),
+            nn.ReLU(inplace=True),
         )
 
-        # Fusion
-        self.fusion = FusionModule(sem_dim, hr_out_dim, fused_dim)
+        # CSRM at deepest scale
+        self.csrm = SpatialCSRM(dims[-1])
 
-        # CSRM in fused space
-        self.csrm = SpatialCSRM(fused_dim)
+        # --- Multi-scale difference fusion (Change-Agent pattern) ---
+        self.cos = nn.CosineSimilarity(dim=1)
 
-        # Decoder: input is concat(F_A', diff, F_B') = 3 * fused_dim
-        self.mask_decoder = MaskDecoder(
-            3 * fused_dim, num_classes, output_size,
+        self.conv_dif = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(d, d, 1), nn.BatchNorm2d(d))
+            for d in dims
+        ])
+        self.conv_fuse = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(3 * d, 2 * d, 3, stride=1, padding=1),
+                nn.BatchNorm2d(2 * d), nn.ReLU(inplace=True),
+                nn.Conv2d(2 * d, 2 * d, 1),
+            ) for d in dims
+        ])
+
+        # --- FPN top-down decoder ---
+        self.to_fused = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(2 * d, 2 * d, 1),
+                nn.BatchNorm2d(2 * d), nn.ReLU(inplace=True),
+                nn.ConvTranspose2d(2 * d, 2 * dims[max(i - 1, 0)], 4, stride=2, padding=1),
+            ) for i, d in enumerate(dims)
+        ])
+
+        # --- Segmentation head ---
+        self.to_seg = nn.Sequential(
+            nn.ConvTranspose2d(2 * dims[0], dims[0], 4, stride=2, padding=1),
+            nn.BatchNorm2d(dims[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dims[0], num_classes, 1),
         )
 
-        # Loss
-        if num_classes > 1:
-            self.loss_fn = MultiClassFocalDiceLoss(
-                num_classes=num_classes,
-                class_weights=[0.2, 1.0, 1.0][:num_classes],
-            )
-        else:
-            self.loss_fn = FocalDiceLoss()
+        # --- Loss: CrossEntropyLoss (matching Change-Agent) ---
+        class_weights = torch.tensor([0.2, 1.0, 1.0], dtype=torch.float32)[:num_classes]
+        self.register_buffer('class_weights', class_weights)
 
-        self._init_weights()
+        self._init_new_weights()
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    def _init_new_weights(self):
+        """Xavier init for non-pretrained modules (skip HR encoder)."""
+        skip = {'hr_encoder'}
+        for name, m in self.named_modules():
+            if any(name.startswith(s) for s in skip):
+                continue
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(
         self,
-        feat_A,        # (B, 257, 1408) frozen EVA-ViT output for image A
-        feat_B,        # (B, 257, 1408) frozen EVA-ViT output for image B
-        img_A,         # (B, 3, 224, 224) normalized image A
-        img_B,         # (B, 3, 224, 224) normalized image B
-        gt_mask=None,  # (B, H, W) long tensor with class indices
+        feat_A,        # (B, 257, 1408) frozen EVA-ViT output
+        feat_B,
+        img_A,         # (B, 3, 224, 224) normalized image
+        img_B,
+        gt_mask=None,  # (B, H, W) long
     ):
-        # --- Path 1: Semantic (frozen ViT → spatial) ---
-        sem_A = self.sem_adapter(feat_A.float())  # (B, sem_dim, 56, 56)
+        # === 1. Multi-scale HR features (Siamese) ===
+        hr_A = self.hr_encoder(img_A)  # [(64,56), (128,28), (256,14)]
+        hr_B = self.hr_encoder(img_B)
+
+        # === 2. Semantic injection at deepest scale ===
+        sem_A = self.sem_adapter(feat_A.float())  # (256, 14, 14)
         sem_B = self.sem_adapter(feat_B.float())
 
-        # --- Path 2: HR spatial detail ---
-        hr_A = self.hr_encoder(img_A.float())     # (B, hr_dim, 56, 56)
-        hr_B = self.hr_encoder(img_B.float())
+        deep_A = self.sem_inject(torch.cat([sem_A, hr_A[2]], dim=1))  # (256, 14)
+        deep_B = self.sem_inject(torch.cat([sem_B, hr_B[2]], dim=1))
 
-        # --- Fusion ---
-        fused_A = self.fusion(sem_A, hr_A)        # (B, fused_dim, 56, 56)
-        fused_B = self.fusion(sem_B, hr_B)
+        # === 3. CSRM at deepest scale ===
+        deep_A, deep_B = self.csrm(deep_A, deep_B)
 
-        # --- CSRM: difference-gated features ---
-        fa_prime, fb_prime, diff = self.csrm(fused_A, fused_B)
+        # === 4. Multi-scale difference fusion (Change-Agent pattern) ===
+        # Scale order: [scale_56, scale_28, scale_14]
+        feat_A_list = [hr_A[0], hr_A[1], deep_A]
+        feat_B_list = [hr_B[0], hr_B[1], deep_B]
 
-        # --- Mask prediction ---
-        mask_input = torch.cat([fa_prime, diff, fb_prime], dim=1)
-        mask_logits = self.mask_decoder(mask_input)  # (B, C, 256, 256)
+        fused_list = []
+        for k in range(3):
+            dif = (
+                self.conv_dif[k](feat_B_list[k] - feat_A_list[k])
+                + self.cos(feat_A_list[k], feat_B_list[k]).unsqueeze(1)
+            )
+            fus = self.conv_fuse[k](
+                torch.cat([feat_A_list[k], dif, feat_B_list[k]], dim=1)
+            )
+            fused_list.append(fus)
+        # fused_list: [(128,56), (256,28), (512,14)]
 
-        # Build outputs
-        if self.num_classes > 1:
-            mask_pred = F.softmax(mask_logits, dim=1)
-            mask_cls = mask_logits.argmax(dim=1)
-        else:
-            mask_pred = torch.sigmoid(mask_logits)
-            mask_cls = (mask_pred > 0.5).long().squeeze(1)
+        # === 5. FPN top-down decoder ===
+        up = self.to_fused[-1](fused_list[-1])  # (512,14) → (256,28)
+        for i in range(len(fused_list) - 2, -1, -1):
+            up = fused_list[i] + up
+            up = self.to_fused[i](up)
+        # up: (128, 112, 112)
 
+        # === 6. Segmentation head ===
+        seg_logits = self.to_seg(up)  # (num_classes, 224, 224)
+        if seg_logits.shape[-2:] != tuple(self.output_size):
+            seg_logits = F.interpolate(
+                seg_logits, size=self.output_size,
+                mode='bilinear', align_corners=False,
+            )
+
+        # === Build outputs ===
+        mask_cls = seg_logits.argmax(dim=1)
         outputs = {
-            'mask_logits': mask_logits,
-            'mask_pred': mask_pred,
+            'mask_logits': seg_logits,
+            'mask_pred': F.softmax(seg_logits, dim=1),
             'mask_cls': mask_cls,
         }
 
         if gt_mask is not None:
-            if self.num_classes > 1:
-                if gt_mask.dim() == 4:
-                    gt_mask = gt_mask.squeeze(1)
-                if gt_mask.shape[-2:] != tuple(self.output_size):
-                    gt_mask = F.interpolate(
-                        gt_mask.unsqueeze(1).float(),
-                        size=self.output_size, mode='nearest',
-                    ).squeeze(1).long()
-            outputs['loss'] = self.loss_fn(mask_logits, gt_mask)
+            if gt_mask.dim() == 4:
+                gt_mask = gt_mask.squeeze(1)
+            if gt_mask.shape[-2:] != tuple(self.output_size):
+                gt_mask = F.interpolate(
+                    gt_mask.unsqueeze(1).float(), size=self.output_size,
+                    mode='nearest',
+                ).squeeze(1).long()
+            outputs['loss'] = F.cross_entropy(
+                seg_logits, gt_mask, weight=self.class_weights,
+            )
 
         return outputs
 
-    def predict(self, feat_A, feat_B, img_A, img_B, threshold=0.5):
+    def predict(self, feat_A, feat_B, img_A, img_B, **kwargs):
         with torch.no_grad():
             return self.forward(feat_A, feat_B, img_A, img_B)['mask_cls']

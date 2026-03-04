@@ -122,74 +122,77 @@ def cosine_lr_schedule(optimizer, epoch, max_epoch, init_lr, min_lr, warmup_epoc
     return lr
 
 
-def compute_metrics(pred_cls, gt_cls, num_classes=3):
+class ConfusionMatrixEvaluator:
     """
-    Full metrics suite for multi-class CD.
+    Global confusion matrix evaluator (matching Change-Agent).
 
-    Reports:
-      - Per-class IoU, F1, Precision, Recall
-      - mIoU_change: mean over change classes only (road+building)
-      - mIoU_3class: mean over all 3 classes (matching Change-Agent protocol)
-      - OA: overall pixel accuracy
-      - binary_iou: merged change-vs-background
+    Accumulates predictions across ALL batches, then computes metrics once.
+    This gives correct IoU (not the biased per-batch average).
     """
-    pred_flat = pred_cls.view(-1).long()
-    gt_flat = gt_cls.view(-1).long()
-    metrics = {}
 
-    iou_change, f1_change = 0.0, 0.0
-    iou_all, n_change = 0.0, 0
+    def __init__(self, num_classes=3):
+        self.num_classes = num_classes
+        self.confusion_matrix = np.zeros((num_classes, num_classes))
 
-    for c in range(num_classes):
-        p = (pred_flat == c)
-        g = (gt_flat == c)
-        tp = (p & g).sum().float()
-        fp = (p & ~g).sum().float()
-        fn = (~p & g).sum().float()
+    def reset(self):
+        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes))
 
-        iou_c = (tp / (tp + fp + fn + 1e-8)).item()
-        prec_c = (tp / (tp + fp + 1e-8)).item()
-        rec_c = (tp / (tp + fn + 1e-8)).item()
-        f1_c = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
+    def add_batch(self, gt, pred):
+        """gt, pred: numpy arrays of class indices."""
+        gt = gt.flatten().astype(int)
+        pred = pred.flatten().astype(int)
+        mask = (gt >= 0) & (gt < self.num_classes)
+        label = self.num_classes * gt[mask] + pred[mask]
+        count = np.bincount(label, minlength=self.num_classes ** 2)
+        self.confusion_matrix += count.reshape(self.num_classes, self.num_classes)
 
-        name = CLASS_NAMES.get(c, str(c))
-        metrics[f'iou_{name}'] = iou_c
-        metrics[f'f1_{name}'] = f1_c
-        metrics[f'prec_{name}'] = prec_c
-        metrics[f'rec_{name}'] = rec_c
+    def compute_metrics(self):
+        cm = self.confusion_matrix
+        metrics = {}
 
-        iou_all += iou_c
-        if c > 0:
-            iou_change += iou_c
-            f1_change += f1_c
-            n_change += 1
+        iou_per_class = np.diag(cm) / (
+            cm.sum(axis=1) + cm.sum(axis=0) - np.diag(cm) + 1e-8
+        )
 
-    metrics['mIoU_change'] = iou_change / max(n_change, 1)
-    metrics['mIoU_3class'] = iou_all / num_classes
-    metrics['mF1_change'] = f1_change / max(n_change, 1)
-    # Keep backward-compat key (used as primary metric for checkpoint saving)
-    metrics['mIoU'] = metrics['mIoU_change']
+        for c in range(self.num_classes):
+            name = CLASS_NAMES.get(c, str(c))
+            metrics[f'iou_{name}'] = iou_per_class[c]
+            tp = cm[c, c]
+            fp = cm[:, c].sum() - tp
+            fn = cm[c, :].sum() - tp
+            metrics[f'prec_{name}'] = tp / (tp + fp + 1e-8)
+            metrics[f'rec_{name}'] = tp / (tp + fn + 1e-8)
+            metrics[f'f1_{name}'] = 2 * tp / (2 * tp + fp + fn + 1e-8)
 
-    # Overall accuracy
-    correct = (pred_flat == gt_flat).sum().float()
-    metrics['OA'] = (correct / gt_flat.numel()).item()
+        metrics['mIoU_3class'] = float(np.nanmean(iou_per_class))
+        change_iou = iou_per_class[1:]
+        metrics['mIoU_change'] = float(np.nanmean(change_iou))
+        metrics['mIoU'] = metrics['mIoU_3class']
 
-    # Binary change IoU (road OR building vs background)
-    pred_bin = (pred_flat > 0)
-    gt_bin = (gt_flat > 0)
-    tp_b = (pred_bin & gt_bin).sum().float()
-    fp_b = (pred_bin & ~gt_bin).sum().float()
-    fn_b = (~pred_bin & gt_bin).sum().float()
-    metrics['binary_iou'] = (tp_b / (tp_b + fp_b + fn_b + 1e-8)).item()
+        metrics['OA'] = float(np.diag(cm).sum() / (cm.sum() + 1e-8))
 
-    return metrics
+        # MPA (mean pixel accuracy per class)
+        acc_cls = np.diag(cm) / (cm.sum(axis=1) + 1e-8)
+        metrics['MPA'] = float(np.nanmean(acc_cls))
+
+        # FWIoU
+        freq = cm.sum(axis=1) / (cm.sum() + 1e-8)
+        metrics['FWIoU'] = float((freq * iou_per_class).sum())
+
+        # Binary change IoU
+        tp_b = cm[1:, 1:].sum()
+        fp_b = cm[0, 1:].sum()
+        fn_b = cm[1:, 0].sum()
+        metrics['binary_iou'] = float(tp_b / (tp_b + fp_b + fn_b + 1e-8))
+
+        return metrics
 
 
 @torch.no_grad()
 def evaluate(model, val_loader, device, num_classes=3):
     model.eval()
+    evaluator = ConfusionMatrixEvaluator(num_classes)
     total_loss = 0
-    total_metrics = {}
     num_batches = 0
 
     for batch in val_loader:
@@ -200,15 +203,15 @@ def evaluate(model, val_loader, device, num_classes=3):
         outputs = model.forward_mask(image_A, image_B, gt_mask)
         total_loss += outputs['loss'].item()
 
-        batch_metrics = compute_metrics(outputs['mask_cls'], gt_mask, num_classes)
-        for k, v in batch_metrics.items():
-            total_metrics[k] = total_metrics.get(k, 0) + v
+        pred_np = outputs['mask_cls'].cpu().numpy()
+        gt_np = gt_mask.cpu().numpy()
+        evaluator.add_batch(gt_np, pred_np)
         num_batches += 1
 
     avg_loss = total_loss / num_batches
-    avg_metrics = {k: v / num_batches for k, v in total_metrics.items()}
+    metrics = evaluator.compute_metrics()
     model.train()
-    return avg_loss, avg_metrics
+    return avg_loss, metrics
 
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, args, writer=None):
@@ -426,7 +429,7 @@ def main():
                     **{f'val_{k}': v for k, v in val_metrics.items()},
                 })
 
-            cur_miou = val_metrics['mIoU']
+            cur_miou = val_metrics['mIoU']  # 3-class mIoU (Change-Agent protocol)
             if cur_miou > best_miou:
                 best_miou = cur_miou
                 model.save_mask_branch(os.path.join(args.output_dir, 'mask_branch_best.pth'))
