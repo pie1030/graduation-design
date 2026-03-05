@@ -123,15 +123,15 @@ class MaskAwarePairTransforms:
         if do_flip:
             mask = F.hflip(mask)
         
-        # Convert to binary tensor
+        # Convert to class-index tensor: 0=bg, 1=road(128), 2=building(255)
         mask_arr = np.array(mask)
         if mask_arr.ndim == 3:
-            # RGB mask - any non-zero channel indicates change
-            binary_mask = (mask_arr.sum(axis=2) > 0).astype(np.float32)
-        else:
-            binary_mask = (mask_arr > 0).astype(np.float32)
+            mask_arr = mask_arr[:, :, 0]  # all channels identical for grayscale PNG
+        class_mask = np.zeros(mask_arr.shape, dtype=np.int64)
+        class_mask[mask_arr == 128] = 1   # road
+        class_mask[mask_arr == 255] = 2   # building
         
-        return torch.from_numpy(binary_mask).unsqueeze(0)  # (1, H, W)
+        return torch.from_numpy(class_mask)  # (H, W) long tensor
 
 
 class MaskEvalTransforms:
@@ -170,10 +170,11 @@ class MaskEvalTransforms:
         mask = F.resize(mask, (self.mask_size, self.mask_size), interpolation=InterpolationMode.NEAREST)
         mask_arr = np.array(mask)
         if mask_arr.ndim == 3:
-            binary_mask = (mask_arr.sum(axis=2) > 0).astype(np.float32)
-        else:
-            binary_mask = (mask_arr > 0).astype(np.float32)
-        return torch.from_numpy(binary_mask).unsqueeze(0)
+            mask_arr = mask_arr[:, :, 0]
+        class_mask = np.zeros(mask_arr.shape, dtype=np.int64)
+        class_mask[mask_arr == 128] = 1   # road
+        class_mask[mask_arr == 255] = 2   # building
+        return torch.from_numpy(class_mask)  # (H, W) long tensor
 
 
 if __name__ == "__main__":

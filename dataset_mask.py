@@ -282,6 +282,24 @@ class BalancedChangeMaskDataset(ChangeMaskDataset):
             return super().__getitem__(idx)
 
 
+def _filter_no_change(samples: List[str], label_dir: str) -> List[str]:
+    """Remove samples whose label is entirely background (all zeros)."""
+    kept = []
+    for f in samples:
+        path = os.path.join(label_dir, f)
+        if os.path.exists(path):
+            arr = np.array(Image.open(path))
+            if arr.ndim == 3:
+                arr = arr[:, :, 0]
+            if arr.max() > 0:
+                kept.append(f)
+        else:
+            kept.append(f)
+    print(f"filter_no_change: {len(samples)} -> {len(kept)} "
+          f"(removed {len(samples)-len(kept)} all-background samples)")
+    return kept
+
+
 def build_mask_dataloaders(
     data_root: str,
     batch_size: int = 8,
@@ -290,6 +308,7 @@ def build_mask_dataloaders(
     mask_size: int = 256,
     annotation_file: Optional[str] = None,
     mask_root: Optional[str] = None,
+    filter_no_change: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train and validation dataloaders for mask training.
@@ -302,8 +321,7 @@ def build_mask_dataloaders(
         mask_size: Output mask size
         annotation_file: Optional JSON annotation for filtering
         mask_root: Optional separate root for mask labels
-                   If None, uses data_root (assumes LEVIR-MCI structure)
-                   If set, can use ChangeChat images with LEVIR-MCI masks
+        filter_no_change: If True, remove all-background samples from train set
     
     Returns:
         (train_loader, val_loader)
@@ -317,6 +335,11 @@ def build_mask_dataloaders(
         annotation_file=annotation_file,
         mask_root=mask_root,
     )
+
+    if filter_no_change:
+        train_dataset.samples = _filter_no_change(
+            train_dataset.samples, train_dataset.dir_label,
+        )
     
     val_dataset = ChangeMaskDataset(
         root=data_root,
@@ -324,7 +347,7 @@ def build_mask_dataloaders(
         image_size=image_size,
         mask_size=mask_size,
         is_train=False,
-        annotation_file=None,  # Use all val samples
+        annotation_file=None,
         mask_root=mask_root,
     )
     

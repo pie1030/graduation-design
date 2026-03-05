@@ -10,12 +10,14 @@ Core Components:
 - GDFA (Global Difference-guided Feature Attention): Difference-modulated attention
 - BI3 (Bidirectional Iterative Interaction): Iterative cross-attention
 - CBF (Change Bi-temporal Fusion): Feature fusion with cosine similarity
-- MultiScaleSkipAdapter: Converts multi-level ViT features into decoder skip
-  connections for high-resolution change map generation
+- HRSpatialEncoder: Lightweight CNN that produces REAL multi-scale spatial
+  features (112x112, 56x56, 28x28) from raw images, solving the ViT 16x16
+  resolution bottleneck
+- CDDecoder: Progressive upsampling with HR skip connections
 
 Adaptation for DeltaVLM:
-- Input: EVA-ViT-G features (B, 257, 1408) + optional multi-scale intermediates
-- Output: Binary change mask (B, 1, H, W)
+- Input: EVA-ViT-G features (B, 257, 1408) + raw images for HR branch
+- Output: Change mask — binary (B, 1, H, W) or multi-class (B, C, H, W)
 """
 
 import math
@@ -27,7 +29,7 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange
 
-from .mask_head import FocalDiceLoss
+from .mask_head import FocalDiceLoss, MultiClassFocalDiceLoss
 
 
 # ============================================================================
@@ -480,6 +482,84 @@ class MultiScaleSkipAdapter(nn.Module):
 
 
 # ============================================================================
+# HR Spatial Encoder: Lightweight CNN for real multi-scale spatial features
+# ============================================================================
+
+class HRSpatialEncoder(nn.Module):
+    """
+    Lightweight shared-weight CNN that extracts genuine multi-scale spatial
+    features from raw 224x224 images.
+
+    Unlike ViT (which produces 16x16 at ALL layers), this CNN produces:
+      Stage 1: 112×112, 64 channels   (7× more spatial detail than ViT)
+      Stage 2:  56×56, 128 channels    (3.5× more)
+      Stage 3:  28×28, 256 channels    (1.75× more)
+
+    For a bi-temporal pair, the encoder runs on each image (shared weights)
+    and returns per-stage *difference* features as skip connections for the
+    CDDecoder.  Total params: ~1.8M — negligible vs the 1B-param ViT.
+    """
+
+    def __init__(self, in_channels: int = 3, dims: Tuple[int, ...] = (64, 128, 256)):
+        super().__init__()
+        self.dims = dims
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 48, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True),
+        )
+
+        self.stage1 = self._make_stage(48, dims[0], stride=1)
+        self.stage2 = self._make_stage(dims[0], dims[1], stride=2)
+        self.stage3 = self._make_stage(dims[1], dims[2], stride=2)
+
+        self._init_weights()
+
+    @staticmethod
+    def _make_stage(in_ch: int, out_ch: int, stride: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward_single(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """(B, 3, 224, 224) → list of spatial features [28x28, 56x56, 112x112]."""
+        x = self.stem(x)           # (B, 48, 112, 112)
+        f1 = self.stage1(x)        # (B, 64, 112, 112)
+        f2 = self.stage2(f1)       # (B, 128,  56,  56)
+        f3 = self.stage3(f2)       # (B, 256,  28,  28)
+        return [f3, f2, f1]
+
+    def forward(
+        self,
+        img_bef: torch.Tensor,
+        img_aft: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """
+        Compute per-scale change (difference) features.
+
+        Returns list of (B, C_i, H_i, W_i) ordered from coarse to fine:
+          [diff_28x28(256ch), diff_56x56(128ch), diff_112x112(64ch)]
+        """
+        feats_bef = self.forward_single(img_bef)
+        feats_aft = self.forward_single(img_aft)
+        return [aft - bef for bef, aft in zip(feats_bef, feats_aft)]
+
+
+# ============================================================================
 # CD Decoder: Change Detection Decoder with Upsampling + Skip Connections
 # ============================================================================
 
@@ -675,14 +755,18 @@ class ChangeAgentCD(nn.Module):
         output_size: Tuple[int, int] = (256, 256),
         dropout: float = 0.1,
         # Multi-scale: list of ViT dim per tapped layer (e.g. [1408]*4)
-        # When provided, enables skip connections in the decoder.
+        # When provided, enables OLD skip connections in the decoder (all 16x16).
         multiscale_dims: Optional[List[int]] = None,
+        # HR branch: lightweight CNN for REAL multi-scale spatial features
+        use_hr_branch: bool = False,
+        hr_dims: Tuple[int, ...] = (64, 128, 256),
     ):
         super().__init__()
         self.eva_dim = eva_dim
         self.hidden_dim = hidden_dim
         self.output_size = output_size
         self.num_classes = num_classes
+        self.use_hr_branch = use_hr_branch
 
         self.adapter = EVAToSpatialAdapter(
             in_dim=eva_dim,
@@ -702,20 +786,32 @@ class ChangeAgentCD(nn.Module):
             out_dim=hidden_dim,
         )
 
-        # Multi-scale skip adapter (converts ViT intermediates -> decoder skips)
-        self.use_multiscale = multiscale_dims is not None and len(multiscale_dims) > 0
+        # Determine skip connection source
         skip_dims_for_decoder = None
-        if self.use_multiscale:
-            n_levels = min(len(multiscale_dims), num_upsample_stages)
-            decoder_stage_dims = [
-                max(hidden_dim // (2 ** (i + 1)), 32)
-                for i in range(n_levels)
-            ]
-            self.ms_adapter = MultiScaleSkipAdapter(
-                vit_dims=multiscale_dims[:n_levels],
-                decoder_dims=decoder_stage_dims,
+
+        if use_hr_branch:
+            # HR branch: real multi-scale from lightweight CNN
+            self.hr_encoder = HRSpatialEncoder(in_channels=3, dims=hr_dims)
+            # HR forward returns [coarse→fine]: [stage3(28x28,256), stage2(56x56,128), stage1(112x112,64)]
+            # This maps to decoder stages: 0(→32x32), 1(→64x64), 2(→128x128)
+            skip_dims_for_decoder = list(reversed(hr_dims))
+            self.use_multiscale = False
+        else:
+            # Legacy: ViT multi-scale skips (all 16x16, limited benefit)
+            self.use_multiscale = (
+                multiscale_dims is not None and len(multiscale_dims) > 0
             )
-            skip_dims_for_decoder = decoder_stage_dims
+            if self.use_multiscale:
+                n_levels = min(len(multiscale_dims), num_upsample_stages)
+                decoder_stage_dims = [
+                    max(hidden_dim // (2 ** (i + 1)), 32)
+                    for i in range(n_levels)
+                ]
+                self.ms_adapter = MultiScaleSkipAdapter(
+                    vit_dims=multiscale_dims[:n_levels],
+                    decoder_dims=decoder_stage_dims,
+                )
+                skip_dims_for_decoder = decoder_stage_dims
 
         self.decoder = CDDecoder(
             in_dim=hidden_dim,
@@ -725,7 +821,13 @@ class ChangeAgentCD(nn.Module):
             skip_dims=skip_dims_for_decoder,
         )
 
-        self.loss_fn = FocalDiceLoss()
+        if num_classes > 1:
+            self.loss_fn = MultiClassFocalDiceLoss(
+                num_classes=num_classes,
+                class_weights=[0.2, 1.0, 1.0][:num_classes],
+            )
+        else:
+            self.loss_fn = FocalDiceLoss()
         self._init_weights()
     
     def _init_weights(self):
@@ -750,14 +852,16 @@ class ChangeAgentCD(nn.Module):
         output_size: Optional[Tuple[int, int]] = None,
         ms_feats_bef: Optional[List[torch.Tensor]] = None,
         ms_feats_aft: Optional[List[torch.Tensor]] = None,
+        img_bef: Optional[torch.Tensor] = None,
+        img_aft: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             feat_bef/aft: (B, 257, 1408) final-layer EVA-ViT features
-            gt_mask: (B, 1, H, W) optional ground truth
+            gt_mask: (B, H, W) long for multi-class, or (B, 1, H, W) for binary
             output_size: target spatial size for the mask
-            ms_feats_bef/aft: optional lists of (B, 257, 1408) from
-                intermediate ViT layers, used for skip connections
+            ms_feats_bef/aft: ViT intermediate features (legacy, all 16x16)
+            img_bef/aft: (B, 3, 224, 224) raw images for HR branch
         """
         output_size = output_size or self.output_size
 
@@ -771,9 +875,11 @@ class ChangeAgentCD(nn.Module):
         # 3. CBF fusion  (B, hidden_dim, 16, 16)
         fused = self.cbf(feat_A_enh, feat_B_enh)
 
-        # 4. Multi-scale skip features (if available)
+        # 4. Skip features: HR branch (real multi-scale) or ViT (legacy 16x16)
         skip_features = None
-        if (self.use_multiscale
+        if self.use_hr_branch and img_bef is not None and img_aft is not None:
+            skip_features = self.hr_encoder(img_bef.float(), img_aft.float())
+        elif (self.use_multiscale
                 and ms_feats_bef is not None
                 and ms_feats_aft is not None):
             skip_features = self.ms_adapter(ms_feats_bef, ms_feats_aft)
@@ -783,13 +889,33 @@ class ChangeAgentCD(nn.Module):
             fused, output_size=output_size,
             skip_features=skip_features,
         )
-        mask_pred = torch.sigmoid(mask_logits)
 
-        outputs = {'mask_logits': mask_logits, 'mask_pred': mask_pred}
+        if self.num_classes > 1:
+            mask_pred = F.softmax(mask_logits, dim=1)        # (B, C, H, W)
+            mask_cls = mask_logits.argmax(dim=1)             # (B, H, W)
+        else:
+            mask_pred = torch.sigmoid(mask_logits)
+            mask_cls = (mask_pred > 0.5).long().squeeze(1)
+
+        outputs = {
+            'mask_logits': mask_logits,
+            'mask_pred': mask_pred,
+            'mask_cls': mask_cls,
+        }
 
         if gt_mask is not None:
-            if gt_mask.shape[-2:] != tuple(output_size):
-                gt_mask = F.interpolate(gt_mask, size=output_size, mode='nearest')
+            if self.num_classes > 1:
+                # gt_mask: (B, H, W) long — resize if needed
+                if gt_mask.dim() == 4:
+                    gt_mask = gt_mask.squeeze(1)
+                if gt_mask.shape[-2:] != tuple(output_size):
+                    gt_mask = F.interpolate(
+                        gt_mask.unsqueeze(1).float(), size=output_size,
+                        mode='nearest',
+                    ).squeeze(1).long()
+            else:
+                if gt_mask.shape[-2:] != tuple(output_size):
+                    gt_mask = F.interpolate(gt_mask, size=output_size, mode='nearest')
             outputs['loss'] = self.loss_fn(mask_logits, gt_mask)
 
         return outputs
@@ -802,12 +928,17 @@ class ChangeAgentCD(nn.Module):
         output_size: Optional[Tuple[int, int]] = None,
         ms_feats_bef: Optional[List[torch.Tensor]] = None,
         ms_feats_aft: Optional[List[torch.Tensor]] = None,
+        img_bef: Optional[torch.Tensor] = None,
+        img_aft: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Returns (B, H, W) class index map."""
         with torch.no_grad():
             outputs = self.forward(
                 feat_bef, feat_aft,
                 output_size=output_size,
                 ms_feats_bef=ms_feats_bef,
                 ms_feats_aft=ms_feats_aft,
+                img_bef=img_bef,
+                img_aft=img_aft,
             )
-            return (outputs['mask_pred'] > threshold).float()
+            return outputs['mask_cls']

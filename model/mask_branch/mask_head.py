@@ -158,7 +158,7 @@ class DiceBCELoss(nn.Module):
 
 
 class FocalDiceLoss(nn.Module):
-    """Focal Loss + Dice Loss for handling class imbalance."""
+    """Focal Loss + Dice Loss for handling class imbalance (binary)."""
     def __init__(
         self,
         alpha: float = 0.25,
@@ -180,14 +180,12 @@ class FocalDiceLoss(nn.Module):
             pred: (B, 1, H, W) predicted logits
             target: (B, 1, H, W) ground truth mask
         """
-        # Focal Loss
         pred_sigmoid = torch.sigmoid(pred)
         bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         pt = torch.where(target == 1, pred_sigmoid, 1 - pred_sigmoid)
         focal_weight = (self.alpha * target + (1 - self.alpha) * (1 - target)) * ((1 - pt) ** self.gamma)
         focal_loss = (focal_weight * bce).mean()
         
-        # Dice Loss
         pred_flat = pred_sigmoid.view(-1)
         target_flat = target.view(-1)
         intersection = (pred_flat * target_flat).sum()
@@ -195,4 +193,75 @@ class FocalDiceLoss(nn.Module):
         dice_loss = 1 - dice
         
         return self.focal_weight * focal_loss + self.dice_weight * dice_loss
+
+
+class MultiClassFocalDiceLoss(nn.Module):
+    """
+    Multi-class Focal CE + per-class Dice loss.
+    
+    Computes weighted CE with focal modulation, plus per-class Dice loss
+    averaged over change classes only (excludes background class 0).
+    """
+    def __init__(
+        self,
+        num_classes: int = 3,
+        gamma: float = 2.0,
+        dice_weight: float = 0.5,
+        ce_weight: float = 0.5,
+        smooth: float = 1.0,
+        class_weights: Optional[list] = None,
+        ignore_index: int = -1,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.gamma = gamma
+        self.dice_weight = dice_weight
+        self.ce_weight = ce_weight
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        
+        if class_weights is not None:
+            self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, C, H, W) logits with C = num_classes
+            target: (B, H, W) long tensor with class indices
+        """
+        B, C, H, W = pred.shape
+        
+        # --- Focal Cross-Entropy ---
+        ce = F.cross_entropy(
+            pred, target,
+            weight=self.class_weights,
+            ignore_index=self.ignore_index,
+            reduction='none',
+        )
+        pt = torch.exp(-F.cross_entropy(
+            pred, target,
+            ignore_index=self.ignore_index,
+            reduction='none',
+        ))
+        focal_ce = ((1 - pt) ** self.gamma * ce).mean()
+        
+        # --- Per-class Dice (only on change classes: 1=road, 2=building) ---
+        pred_soft = F.softmax(pred, dim=1)  # (B, C, H, W)
+        target_oh = F.one_hot(target.clamp(min=0), C).permute(0, 3, 1, 2).float()
+        
+        dice_sum = 0.0
+        n_change_cls = 0
+        for cls in range(1, C):  # skip background (class 0)
+            p = pred_soft[:, cls].reshape(-1)
+            g = target_oh[:, cls].reshape(-1)
+            inter = (p * g).sum()
+            dice = (2.0 * inter + self.smooth) / (p.sum() + g.sum() + self.smooth)
+            dice_sum += (1 - dice)
+            n_change_cls += 1
+        
+        dice_loss = dice_sum / max(n_change_cls, 1)
+        
+        return self.ce_weight * focal_ce + self.dice_weight * dice_loss
 
