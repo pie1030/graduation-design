@@ -1,0 +1,24 @@
+# Ablation: No HR branch (semantic-only, no ResNet-18)
+data_root: /root/autodl-tmp/LEVIR-MCI-dataset/images
+pretrained: ./checkpoint_best.pth
+mask_decoder_type: delta_cd
+mask_size: 256
+image_size: 224
+num_classes: 3
+mask_hidden_dim: 256
+mask_num_stages: 4
+epochs: 100
+batch_size: 8
+lr: 1.0e-04
+weight_decay: 0.01
+warmup_epochs: 3
+min_lr: 1.0e-06
+filter_no_change: false
+output_dir: ./output/ablation_no_hr
+seed: 42
+num_workers: 4
+log_freq: 50
+save_freq: 10
+eval_freq: 1
+# Ablation flag
+ablation_no_hr: true

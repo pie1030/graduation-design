@@ -1,0 +1,36 @@
+# DeltaCD v2 Training Config
+# Multi-scale FPN architecture aligned with Change-Agent
+# EVA-ViT semantic injection + Pretrained ResNet-18 HR encoder
+
+data_root: /root/autodl-tmp/LEVIR-MCI-dataset/images
+mask_root: null
+pretrained: ./checkpoint_best.pth
+
+# Architecture
+mask_decoder_type: delta_cd
+mask_size: 256
+image_size: 224
+num_classes: 3
+
+# Legacy compat (unused by delta_cd but needed by parser)
+mask_hidden_dim: 256
+mask_num_stages: 4
+
+# Training (aligned with Change-Agent: Adam, LR=1e-4, 100 epochs)
+epochs: 100
+batch_size: 8
+lr: 1.0e-04
+weight_decay: 0.01
+warmup_epochs: 3
+min_lr: 1.0e-06
+
+# All samples (no background filtering)
+filter_no_change: false
+
+# Output & logging
+output_dir: ./output/delta_cd_v2
+seed: 42
+num_workers: 4
+log_freq: 50
+save_freq: 10
+eval_freq: 1
