@@ -49,12 +49,13 @@ class DeltaVLMPredictor:
     def __init__(self, ckpt, decoder_type="delta_cd", num_classes=3, device="cuda"):
         from model.blip2_vicua_mask import Blip2VicunaMask
         self.device = torch.device(device)
+        hidden_dim = 512 if decoder_type == "change_agent" else 256
         self.model = Blip2VicunaMask(
             vit_model="eva_clip_g", img_size=224, drop_path_rate=0,
             use_grad_checkpoint=False, vit_precision="fp16", freeze_vit=True,
             num_query_token=32, llm_model="./vicuna-7b-v1.5", prompt="",
             max_txt_len=128, enable_mask_branch=True,
-            mask_hidden_dim=256, mask_num_stages=4, mask_output_size=(256, 256),
+            mask_hidden_dim=hidden_dim, mask_num_stages=4, mask_output_size=(256, 256),
             freeze_for_mask_training=True, mask_training_mode=True,
             mask_decoder_type=decoder_type, num_classes=num_classes,
         )
@@ -67,7 +68,7 @@ class DeltaVLMPredictor:
     @torch.no_grad()
     def predict(self, a, b):
         out = self.model.forward_mask(a.to(self.device), b.to(self.device), None)
-        logits = out.get("mask_logits") or out.get("logits")
+        logits = out["mask_logits"] if "mask_logits" in out else out["logits"]
         return logits.argmax(1).cpu()
 
 class SegformerPredictor:

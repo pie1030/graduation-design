@@ -34,7 +34,7 @@ fi
 # --- 2. SegformerCD (ChangeFormer-style) on LEVIR-MCI (3-class) ---
 if [ "$SKIP_SEG" = false ]; then
     echo ">>> [2/3] SegformerCD on LEVIR-MCI  start: $(date)"
-    python trainSegformerMci.py \
+    python train_segformer_cd.py \
         --data_root /root/autodl-tmp/LEVIR-MCI-dataset/images \
         --output_dir ./output/segformer_mci \
         --epochs 100 --batch_size 16 \
