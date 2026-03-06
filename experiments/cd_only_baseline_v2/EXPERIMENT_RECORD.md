@@ -198,7 +198,24 @@ python analyze_cd.py --checkpoint experiments/cd_only_baseline_v2/mask_branch_be
 
 ---
 
-## 11. Known Observations
+## 11. Ablation Study Results (50 epochs each)
+
+| Variant | mIoU(3cls) | IoU_road | IoU_bldg | mF1(change) | OA | Best Ep |
+|---|---|---|---|---|---|---|
+| **Full model** | **0.8409** | **0.7547** | **0.7903** | **0.8716** | **0.9792** | 90 |
+| w/o CSRM | 0.8336 (−0.73%) | 0.7443 | 0.7801 | 0.8649 | 0.9778 | 47 |
+| w/o HR branch | 0.7339 (−12.7%) | 0.6105 | 0.6356 | 0.7677 | 0.9575 | 41 |
+| w/o Semantic inj. | 0.8254 (−1.84%) | 0.7392 | 0.7574 | 0.8560 | 0.9761 | 47 |
+
+**Key findings**:
+- HR branch is the most critical component (−12.7% mIoU without it)
+- Semantic injection from EVA-ViT provides stable improvement (+1.8% mIoU)
+- CSRM contributes moderately (+0.7% mIoU); gate modulation adds value but is not dominant
+- All ablations trained for 50 epochs; full model trained 100 epochs (best at epoch 90)
+
+---
+
+## 12. Known Observations
 
 1. **Overfitting**: Val loss increases after epoch 10 (0.0862 → 0.1608 at best epoch), but mIoU continues to improve slowly. The model is well-calibrated in terms of classification boundaries but not in terms of confidence scores.
 2. **CSRM gate health**: Gate values are well-distributed (mean ~0.41, 62% in [0.3, 0.7]), not saturated.

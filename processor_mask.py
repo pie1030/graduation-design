@@ -34,7 +34,9 @@ class MaskAwarePairTransforms:
         crop_scale: tuple = (0.95, 1.0),
         rotation_range: tuple = (-15, 15),
         flip_prob: float = 0.5,
+        label_mode: str = 'levir_mci',
     ):
+        self.label_mode = label_mode
         self.image_size = image_size
         self.mask_size = mask_size
         self.crop_scale = crop_scale
@@ -123,23 +125,31 @@ class MaskAwarePairTransforms:
         if do_flip:
             mask = F.hflip(mask)
         
-        # Convert to class-index tensor: 0=bg, 1=road(128), 2=building(255)
+        # Convert to class-index tensor
         mask_arr = np.array(mask)
         if mask_arr.ndim == 3:
             mask_arr = mask_arr[:, :, 0]  # all channels identical for grayscale PNG
         class_mask = np.zeros(mask_arr.shape, dtype=np.int64)
-        class_mask[mask_arr == 128] = 1   # road
-        class_mask[mask_arr == 255] = 2   # building
-        
+        if self.label_mode == 'binary':
+            # LEVIR-CD: 0=no-change, 255=change
+            class_mask[mask_arr > 0] = 1
+        else:
+            # LEVIR-MCI: 0=bg, 128=road, 255=building
+            class_mask[mask_arr == 128] = 1
+            class_mask[mask_arr == 255] = 2
+
         return torch.from_numpy(class_mask)  # (H, W) long tensor
 
 
 class MaskEvalTransforms:
     """
     Evaluation transforms for mask prediction (no augmentation).
+
+    label_mode: 'levir_mci' or 'binary' (see MaskAwarePairTransforms)
     """
     
-    def __init__(self, image_size: int = 224, mask_size: int = 256):
+    def __init__(self, image_size: int = 224, mask_size: int = 256, label_mode: str = 'levir_mci'):
+        self.label_mode = label_mode
         self.image_size = image_size
         self.mask_size = mask_size
         
@@ -172,8 +182,11 @@ class MaskEvalTransforms:
         if mask_arr.ndim == 3:
             mask_arr = mask_arr[:, :, 0]
         class_mask = np.zeros(mask_arr.shape, dtype=np.int64)
-        class_mask[mask_arr == 128] = 1   # road
-        class_mask[mask_arr == 255] = 2   # building
+        if self.label_mode == 'binary':
+            class_mask[mask_arr > 0] = 1
+        else:
+            class_mask[mask_arr == 128] = 1
+            class_mask[mask_arr == 255] = 2
         return torch.from_numpy(class_mask)  # (H, W) long tensor
 
 

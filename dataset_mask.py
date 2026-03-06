@@ -33,6 +33,7 @@ class ChangeMaskDataset(Dataset):
         is_train: bool = True,
         annotation_file: Optional[str] = None,
         mask_root: Optional[str] = None,
+        label_mode: str = 'levir_mci',
     ):
         """
         Args:
@@ -44,6 +45,7 @@ class ChangeMaskDataset(Dataset):
             annotation_file: Optional JSON annotation file
             mask_root: Optional separate root for mask labels (if None, uses root)
                        This allows using ChangeChat images with LEVIR-MCI masks
+            label_mode: 'levir_mci' (default) or 'binary' (for LEVIR-CD)
         """
         super().__init__()
         self.root = root
@@ -73,14 +75,16 @@ class ChangeMaskDataset(Dataset):
             self.transform = MaskAwarePairTransforms(
                 image_size=image_size,
                 mask_size=mask_size,
-                crop_scale=(0.95, 1.0),    # 0-5% crop
-                rotation_range=(-15, 15),   # ±15° rotation
+                crop_scale=(0.95, 1.0),
+                rotation_range=(-15, 15),
                 flip_prob=0.5,
+                label_mode=label_mode,
             )
         else:
             self.transform = MaskEvalTransforms(
                 image_size=image_size,
                 mask_size=mask_size,
+                label_mode=label_mode,
             )
         
         print(f"ChangeMaskDataset[{split}]: {len(self.samples)} samples")
@@ -309,6 +313,7 @@ def build_mask_dataloaders(
     annotation_file: Optional[str] = None,
     mask_root: Optional[str] = None,
     filter_no_change: bool = False,
+    label_mode: str = 'levir_mci',
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train and validation dataloaders for mask training.
@@ -334,6 +339,7 @@ def build_mask_dataloaders(
         is_train=True,
         annotation_file=annotation_file,
         mask_root=mask_root,
+        label_mode=label_mode,
     )
 
     if filter_no_change:
@@ -349,6 +355,7 @@ def build_mask_dataloaders(
         is_train=False,
         annotation_file=None,
         mask_root=mask_root,
+        label_mode=label_mode,
     )
     
     train_loader = DataLoader(

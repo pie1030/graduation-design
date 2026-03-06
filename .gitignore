@@ -15,5 +15,15 @@ __pycache__/
 tensorboard/
 wandb/
 
+# Data files (keep locally, too large for git)
+*.json
+!requirements.json
+
+# Cache
+.cache/
+
+# Images
+*.png
+
 # System
 .DS_Store

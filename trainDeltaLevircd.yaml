@@ -1,0 +1,36 @@
+# DeltaVLM (DeltaCD) on LEVIR-CD — Binary Change Detection
+# Uses same architecture as LEVIR-MCI experiment but with 2 classes
+# Labels: 0=no-change, 1=change (converted from 0/255 originals)
+
+data_root: /root/autodl-tmp/LEVIR-CD/images
+mask_root: null
+pretrained: ./checkpoint_best.pth
+
+mask_decoder_type: delta_cd
+mask_size: 256
+image_size: 224
+num_classes: 2
+
+# Legacy compat
+mask_hidden_dim: 256
+mask_num_stages: 4
+
+# Training — same hyperparams as LEVIR-MCI for fair comparison
+epochs: 100
+batch_size: 8
+lr: 1.0e-04
+weight_decay: 0.01
+warmup_epochs: 3
+min_lr: 1.0e-06
+
+# LEVIR-CD is heavily imbalanced (~5% change pixels); weight bg lower
+# class_weights: [0.1, 1.0]
+
+filter_no_change: false
+
+output_dir: ./output/delta_levircd
+seed: 42
+num_workers: 4
+log_freq: 50
+save_freq: 10
+eval_freq: 1

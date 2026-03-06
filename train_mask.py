@@ -179,6 +179,12 @@ class ConfusionMatrixEvaluator:
         freq = cm.sum(axis=1) / (cm.sum() + 1e-8)
         metrics['FWIoU'] = float((freq * iou_per_class).sum())
 
+        # mF1 (3-class and change-only)
+        f1_all = [metrics[f'f1_{CLASS_NAMES[c]}'] for c in range(self.num_classes)]
+        metrics['mF1_3class'] = float(np.nanmean(f1_all))
+        f1_change = [metrics[f'f1_{CLASS_NAMES[c]}'] for c in range(1, self.num_classes)]
+        metrics['mF1_change'] = float(np.nanmean(f1_change))
+
         # Binary change IoU
         tp_b = cm[1:, 1:].sum()
         fp_b = cm[0, 1:].sum()
@@ -283,6 +289,9 @@ def main():
     # Build dataloaders
     logging.info("Building dataloaders...")
     filter_nc = getattr(args, 'filter_no_change', False)
+    # Use binary label mode for 2-class datasets (e.g. LEVIR-CD)
+    num_cls = getattr(args, 'num_classes', 3)
+    lbl_mode = getattr(args, 'label_mode', 'binary' if num_cls == 2 else 'levir_mci')
     train_loader, val_loader = build_mask_dataloaders(
         data_root=args.data_root,
         batch_size=args.batch_size,
@@ -291,6 +300,7 @@ def main():
         mask_size=args.mask_size,
         mask_root=args.mask_root,
         filter_no_change=filter_nc,
+        label_mode=lbl_mode,
     )
     if filter_nc:
         logging.info("Balanced sampling enabled: all-background samples filtered")
@@ -403,7 +413,7 @@ def main():
                 f"Epoch [{epoch+1}/{args.epochs}] Val Loss: {val_loss:.4f} "
                 f"mIoU(change): {val_metrics['mIoU_change']:.4f} "
                 f"mIoU(3cls): {val_metrics['mIoU_3class']:.4f} "
-                f"mF1: {val_metrics.get('mF1_change',0):.4f} "
+                f"mF1(change): {val_metrics.get('mF1_change',0):.4f} "
                 f"OA: {val_metrics.get('OA',0):.4f}"
             )
             logging.info(
