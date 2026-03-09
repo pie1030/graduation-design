@@ -103,19 +103,19 @@ python benchmark.py
 | w/o HR branch | 0.8269 | 0.8601 | 0.9769 |
 | w/o Semantic | 0.8341 | 0.8671 | 0.9783 |
 
-## Project Structure
+## Structure
 
 ```
 DeltaVLM/
-├── configs/              # Training configs (CD, baselines, ablations)
+├── configs/              
 ├── model/
-│   ├── blip2_vlm.py      # Unified CD+CC model entry point
-│   ├── blip2_vicuna.py    # Base Vicuna model
+│   ├── blip2_vlm.py      # Unified CD-CC model entry point
+│   ├── blip2_vicuna.py   
 │   ├── blip2.py           # BLIP-2 backbone (EVA-ViT + Q-Former)
 │   ├── eva_vit.py         # EVA-ViT-G visual encoder
-│   ├── Qformer.py         # Q-Former
+│   ├── Qformer.py         
 │   └── mask_branch/
-│       ├── delta_cd.py    # DeltaCD v2 (ours: CSRM + HR + FPN)
+│       ├── delta_cd.py    # CSRM + HR + FPN
 │       ├── agent_decoder.py  # Change-Agent CD module
 │       ├── agent_encoder.py  # HR spatial encoder
 │       ├── segformer.py      # Segformer backbone
@@ -123,15 +123,15 @@ DeltaVLM/
 │       └── mask_head.py      # Shared mask head
 ├── train_cd.py           # CD training script
 ├── train_segformer.py    # SegformerCD baseline training
-├── analyze.py            # Module visualization & diagnostics
-├── compare.py            # Multi-model qualitative comparison
-├── predict.py            # Inference & prediction
-├── benchmark.py          # Efficiency analysis
-├── ablations.sh          # Run all ablation experiments
+├── analyze.py            # visualize
+├── compare.py            
+├── predict.py            
+├── benchmark.py         
+├── ablations.sh          # Run ablation experiments
 ├── dataset_cd.py         # CD dataset (LEVIR-MCI)
 ├── processor_cd.py       # CD augmentation
 ├── eval_func/            # Caption evaluation metrics
-├── utils.py              # Distributed training utilities
-├── logger.py             # Metric logging
+├── utils.py            
+├── logger.py             
 └── requirements.txt
 ```
