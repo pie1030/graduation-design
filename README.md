@@ -122,20 +122,16 @@ DeltaVLM/
 │       ├── segformer_cd.py   # SegformerCD baseline
 │       └── mask_head.py      # Shared mask head
 ├── train_cd.py           # CD training script
-├── train_cc.py           # CC training script
-├── train_segformer.py    # SegformerCD training
+├── train_segformer.py    # SegformerCD baseline training
 ├── analyze.py            # Module visualization & diagnostics
 ├── compare.py            # Multi-model qualitative comparison
 ├── predict.py            # Inference & prediction
 ├── benchmark.py          # Efficiency analysis
 ├── ablations.sh          # Run all ablation experiments
 ├── dataset_cd.py         # CD dataset (LEVIR-MCI)
-├── dataset.py            # CC dataset
 ├── processor_cd.py       # CD augmentation
-├── processor.py          # CC augmentation
-├── eval_func/            # Caption evaluation (BLEU, CIDEr, METEOR, ROUGE)
-├── config.py             # Config utilities
-├── logger.py             # Logging
-├── optims.py             # Optimizers & schedulers
+├── eval_func/            # Caption evaluation metrics
+├── utils.py              # Distributed training utilities
+├── logger.py             # Metric logging
 └── requirements.txt
 ```
