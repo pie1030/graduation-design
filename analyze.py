@@ -1,7 +1,7 @@
 """
 Comprehensive CD Analysis Script for DeltaVLM.
 Generates: prediction gallery, gate maps, HR features, error maps, confusion matrix.
-Usage: python analyze_cd.py
+Usage: python analyze.py
 """
 import argparse
 import os
@@ -16,8 +16,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset_mask import build_mask_dataloaders
-from model.blip2_vicua_mask import Blip2VicunaMask
+from dataset_cd import build_mask_dataloaders
+from model.blip2_vlm import Blip2VicunaMask
 
 CLASS_COLORS = np.array([[0, 0, 0], [255, 255, 0], [255, 0, 0]], dtype=np.uint8)
 MEAN = np.array([0.48145466, 0.4578275, 0.40821073])
@@ -240,7 +240,7 @@ def main():
     all_p = np.concatenate(all_p)
     all_g = np.concatenate(all_g)
 
-    from train_mask import ConfusionMatrixEvaluator
+    from train_cd import ConfusionMatrixEvaluator
     ev = ConfusionMatrixEvaluator(3)
     ev.add_batch(all_g, all_p)
     metrics = ev.compute_metrics()

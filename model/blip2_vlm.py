@@ -20,7 +20,7 @@ import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 
 from model.blip2_vicua import Blip2VicunaInstruct
-from model.mask_branch.change_agent_cd import ChangeAgentCD
+from model.mask_branch.agent_decoder import ChangeAgentCD
 from model.mask_branch.delta_cd import DeltaCD
 
 

@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Optional, Tuple, Callable
 
 # Use mask-aware transforms for synchronized augmentation
-from processor_mask import MaskAwarePairTransforms, MaskEvalTransforms
+from processor_cd import MaskAwarePairTransforms, MaskEvalTransforms
 
 
 class ChangeMaskDataset(Dataset):

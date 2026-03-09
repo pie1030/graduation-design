@@ -1,130 +1,141 @@
-# DeltaVLM: Unified Change Detection and Change Captioning via Shared Difference Representation
+# DeltaVLM
 
-A unified vision-language framework for remote sensing change understanding. DeltaVLM performs both **pixel-level Change Detection (CD)** and **language-level Change Captioning (CC)** through a shared Cross-temporal Spatial Reasoning Module (CSRM).
+Unified Change Detection and Change Captioning framework built on EVA-ViT-G (frozen backbone) with a self-designed **CSRM** (Cross-temporal Spatial Reasoning Module) for shared difference representation learning.
 
-## Architecture Overview
+## Architecture
 
 ```
-Image_A, Image_B (bi-temporal pair)
-        │
-        ▼
-  EVA-ViT-G (frozen backbone, 986M)
-        │
-        ▼ feat_A, feat_B  (257 tokens, 1408-dim)
-        │
-        ▼
-┌────────────────────────────────────┐
-│  CSRM (Cross-temporal Spatial      │
-│  Reasoning Module)                 │
-│  gate-modulated difference repr.   │
-└──────────┬─────────────────────────┘
-           │
-    ┌──────┴───────┐
-    ▼              ▼
- CC Branch      CD Branch (DeltaCD v2)
- Q-Former →     SemanticAdapter →
- Vicuna LLM →   HR Encoder (ResNet-18) →
- Caption        Multi-scale Diff Fusion →
-                FPN Decoder → Change Map
+Image A, Image B
+     |
+  EVA-ViT-G (frozen)          ResNet-18 HR Encoder (trainable)
+     |                              |
+  Semantic Adapter              Multi-scale features
+     |                         (56x56, 28x28, 14x14)
+     +----------Fusion-----------+
+                 |
+              CSRM (gate-modulated difference)
+                 |
+          FPN Decoder → Change Map (256x256, 3-class)
+                 |
+          Q-Former + Vicuna → Change Caption (optional)
 ```
 
-## CD Branch: DeltaCD v2
+**Core innovation**: CSRM produces a unified difference representation that serves both pixel-level CD and language-level CC tasks.
 
-Multi-scale change detection aligned with [Change-Agent](https://github.com/Chen-Yang-Liu/Change-Agent) pipeline.
+## Setup
 
-**Key components:**
-- **Path 1 (frozen)**: EVA-ViT semantic features → Semantic Adapter (1408d → 256d, 14x14)
-- **Path 2 (trainable)**: Pretrained ResNet-18 → multi-scale spatial features (56x56, 28x28, 14x14)
-- **Fusion**: Semantic injection at deepest scale + CSRM gate modulation
-- **Decoder**: FPN top-down with multi-scale difference fusion (conv_dif + cosine similarity + conv_fuse)
-- **Loss**: CrossEntropyLoss with class weights [0.2, 1.0, 1.0]
+```bash
+pip install -r requirements.txt
+```
 
-**Trainable parameters**: 13.6M (1.4% of total model)
+**Pretrained weights** (place in project root):
+- `checkpoint_best.pth` — DeltaVLM pretrained (EVA-ViT-G + Q-Former)
+- `vicuna-7b-v1.5/` — Vicuna LLM (for CC branch only)
 
-## Current Results: CD-Only on LEVIR-MCI
+**Dataset**: [LEVIR-MCI](https://github.com/Chen-Yang-Liu/LEVIR-MCI) at `/root/autodl-tmp/LEVIR-MCI-dataset/images/`
 
-| Metric | Value |
-|---|---|
-| mIoU (3-class) | **0.8409** |
-| mIoU (change-only) | 0.7725 |
-| IoU (road) | 0.7547 |
-| IoU (building) | 0.7903 |
-| IoU (background) | 0.9777 |
-| F1 (road) | 0.8602 |
-| F1 (building) | 0.8829 |
-| OA | 0.9792 |
+```
+images/
+  ├── train/  (A/, B/, label/)
+  ├── val/
+  └── test/
+```
 
-> Full experiment record: [`experiments/cd_only_baseline_v2/EXPERIMENT_RECORD.md`](experiments/cd_only_baseline_v2/EXPERIMENT_RECORD.md)
+## Training
+
+### Change Detection (DeltaVLM)
+
+```bash
+python train_cd.py --cfg_path configs/cd.yaml
+```
+
+### SOTA Baselines
+
+```bash
+# Change-Agent decoder (EVA-ViT backbone, fair comparison)
+python train_cd.py --cfg_path configs/cd_agent.yaml
+
+# SegformerCD (standalone Segformer-B1 backbone)
+python train_segformer.py --epochs 100 --batch_size 16
+```
+
+### Ablation Studies
+
+```bash
+bash ablations.sh
+```
+
+Configs: `configs/abl_nocsrm.yaml`, `configs/abl_nohr.yaml`, `configs/abl_nosem.yaml`
+
+## Evaluation & Visualization
+
+```bash
+# Module-level analysis (gate maps, HR features, confusion matrix)
+python analyze.py --checkpoint <path_to_best.pth>
+
+# Qualitative comparison (DeltaVLM vs Change-Agent vs SegformerCD)
+python compare.py \
+    --deltavlm    <deltavlm_ckpt> \
+    --change_agent <agent_ckpt> \
+    --segformer   <segformer_ckpt> \
+    --num_samples 20
+
+# Efficiency benchmark (FLOPs, params, FPS, VRAM)
+python benchmark.py
+```
+
+## Results on LEVIR-MCI (3-class)
+
+### SOTA Comparison
+
+| Method | mIoU | IoU_road | IoU_bldg | mF1(chg) | OA |
+|--------|------|----------|----------|----------|------|
+| **DeltaVLM (Ours)** | **0.8409** | 0.7547 | 0.7903 | 0.8716 | 0.9792 |
+| Change-Agent decoder | 0.8196 | 0.7185 | 0.7646 | 0.8514 | 0.9771 |
+| SegformerCD | 0.7829 | 0.6488 | 0.7287 | 0.8150 | 0.9727 |
+
+### Ablation Study
+
+| Variant | mIoU | mF1(chg) | OA |
+|---------|------|----------|------|
+| Full model | **0.8409** | **0.8716** | **0.9792** |
+| w/o CSRM | 0.8285 | 0.8587 | 0.9776 |
+| w/o HR branch | 0.8269 | 0.8601 | 0.9769 |
+| w/o Semantic | 0.8341 | 0.8671 | 0.9783 |
 
 ## Project Structure
 
 ```
 DeltaVLM/
+├── configs/              # Training configs (CD, baselines, ablations)
 ├── model/
-│   ├── blip2_vicua.py              # Base model with CSRM (CC branch)
-│   ├── blip2_vicua_mask.py         # Extended model with CD branch
-│   ├── eva_vit.py                  # EVA-ViT-G backbone
+│   ├── blip2_vlm.py      # Unified CD+CC model entry point
+│   ├── blip2_vicuna.py    # Base Vicuna model
+│   ├── blip2.py           # BLIP-2 backbone (EVA-ViT + Q-Former)
+│   ├── eva_vit.py         # EVA-ViT-G visual encoder
+│   ├── Qformer.py         # Q-Former
 │   └── mask_branch/
-│       ├── delta_cd.py             # DeltaCD v2 (current CD implementation)
-│       └── change_agent_cd.py      # Legacy CD module
-├── train_mask.py                   # CD training script
-├── train_delta_cd.yaml             # CD training config
-├── dataset_mask.py                 # LEVIR-MCI dataset loader
-├── processor_mask.py               # Data augmentation
-├── analyze_cd.py                   # Visualization & analysis script
-├── experiments/
-│   └── cd_only_baseline_v2/        # Frozen experiment snapshot
-│       ├── EXPERIMENT_RECORD.md    # Complete experiment record
-│       ├── config.yaml             # Training config
-│       ├── mask_branch_best.pth    # Best checkpoint (epoch 90)
-│       ├── mask_branch_final.pth   # Final checkpoint (epoch 100)
-│       ├── train.log               # Training log
-│       └── *.py.snapshot           # Source code at time of experiment
-├── ablation_no_csrm.yaml          # Ablation: w/o CSRM
-├── ablation_no_hr.yaml            # Ablation: w/o HR branch
-├── ablation_no_sem.yaml           # Ablation: w/o semantic injection
-└── docs/
-    └── ARCHITECTURE_OVERVIEW_AND_FIGURE_PROMPTS.md
+│       ├── delta_cd.py    # DeltaCD v2 (ours: CSRM + HR + FPN)
+│       ├── agent_decoder.py  # Change-Agent CD module
+│       ├── agent_encoder.py  # HR spatial encoder
+│       ├── segformer.py      # Segformer backbone
+│       ├── segformer_cd.py   # SegformerCD baseline
+│       └── mask_head.py      # Shared mask head
+├── train_cd.py           # CD training script
+├── train_cc.py           # CC training script
+├── train_segformer.py    # SegformerCD training
+├── analyze.py            # Module visualization & diagnostics
+├── compare.py            # Multi-model qualitative comparison
+├── predict.py            # Inference & prediction
+├── benchmark.py          # Efficiency analysis
+├── ablations.sh          # Run all ablation experiments
+├── dataset_cd.py         # CD dataset (LEVIR-MCI)
+├── dataset.py            # CC dataset
+├── processor_cd.py       # CD augmentation
+├── processor.py          # CC augmentation
+├── eval_func/            # Caption evaluation (BLEU, CIDEr, METEOR, ROUGE)
+├── config.py             # Config utilities
+├── logger.py             # Logging
+├── optims.py             # Optimizers & schedulers
+└── requirements.txt
 ```
-
-## Dataset
-
-**LEVIR-MCI** (Multi-Class Imagery): 3-class semantic change detection (background, road, building)
-
-| Split | Pairs |
-|---|---|
-| Train | 6,815 |
-| Val | 1,333 |
-| Test | 1,929 |
-
-## Training
-
-```bash
-# CD-only training
-python train_mask.py --cfg_path train_delta_cd.yaml
-
-# Ablation experiments
-python train_mask.py --cfg_path ablation_no_csrm.yaml
-python train_mask.py --cfg_path ablation_no_hr.yaml
-python train_mask.py --cfg_path ablation_no_sem.yaml
-
-# Visualization & analysis
-python analyze_cd.py --checkpoint experiments/cd_only_baseline_v2/mask_branch_best.pth
-```
-
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.x
-- torchvision
-- timm
-- transformers
-- matplotlib
-- numpy
-- PyYAML
-
-## Acknowledgements
-
-- [Change-Agent](https://github.com/Chen-Yang-Liu/Change-Agent) (CD architecture reference)
-- [BLIP-2](https://github.com/salesforce/LAVIS) (VLM backbone)
-- [EVA-CLIP](https://github.com/baaivision/EVA) (Visual encoder)

@@ -4,7 +4,7 @@ Generates per-sample comparison panels and FP/FN error maps.
 Run after baselines (Change-Agent, SegformerCD) have finished training.
 
 Usage:
-    python compareViz.py
+    python compare.py
         --deltavlm    experiments/cd_only_baseline_v2/mask_branch_best.pth
         --change_agent output/mask_branch_change_agent/XXX/mask_branch_best.pth
         --segformer   output/segformer_mci/XXX/best.pth
@@ -15,7 +15,7 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt, matplotlib.patches as mpatches
 from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset_mask import ChangeMaskDataset
+from dataset_cd import ChangeMaskDataset
 
 CLASS_COLORS = {0: (220,220,220), 1: (255,165,0), 2: (65,105,225)}
 CLASS_NAMES = {0: "bg", 1: "road", 2: "building"}
@@ -47,7 +47,7 @@ def align_pred(pred, gt):
 
 class DeltaVLMPredictor:
     def __init__(self, ckpt, decoder_type="delta_cd", num_classes=3, device="cuda"):
-        from model.blip2_vicua_mask import Blip2VicunaMask
+        from model.blip2_vlm import Blip2VicunaMask
         self.device = torch.device(device)
         hidden_dim = 512 if decoder_type == "change_agent" else 256
         self.model = Blip2VicunaMask(

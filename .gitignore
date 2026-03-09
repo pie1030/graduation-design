@@ -1,10 +1,10 @@
-# Large model files
+# Weights & checkpoints
 *.pth
 *.bin
 *.safetensors
 *.ckpt
 
-# Output
+# Output (local only)
 output/
 __pycache__/
 *.pyc
@@ -15,15 +15,13 @@ __pycache__/
 tensorboard/
 wandb/
 
-# Data files (keep locally, too large for git)
+# Data files (keep locally)
 *.json
 !requirements.json
 
-# Cache
+# Cache & system
 .cache/
-
-# Images
-*.png
-
-# System
 .DS_Store
+
+# Temp scripts
+_*.py

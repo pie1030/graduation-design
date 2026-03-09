@@ -6,8 +6,8 @@ Generates:
   2. Color change maps: red=building, yellow=road, black=background
 
 Usage:
-    python predict_mask.py \
-        --cfg_path train_mask_change_agent.yaml \
+    python predict.py \
+        --cfg_path configs/cd_agent.yaml \
         --checkpoint ./output/mask_branch_change_agent/<run>/mask_branch_best.pth \
         --save_dir ./results
 """
@@ -24,9 +24,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dataset_mask import build_mask_dataloaders, ChangeMaskDataset
-from model.blip2_vicua_mask import Blip2VicunaMask
-from processor_mask import MaskEvalTransforms
+from dataset_cd import build_mask_dataloaders, ChangeMaskDataset
+from model.blip2_vlm import Blip2VicunaMask
+from processor_cd import MaskEvalTransforms
 
 CLASS_NAMES = {0: 'bg', 1: 'road', 2: 'building'}
 # Color palette: 0=black(bg), 1=yellow(road), 2=red(building)

@@ -1,7 +1,7 @@
 """
 Standalone SegformerCD training on LEVIR-MCI (3-class).
 Fair SOTA baseline: same dataset, same evaluator, same epochs as DeltaVLM.
-Usage: python train_segformer_cd.py --epochs 100 --batch_size 16
+Usage: python train_segformer.py --epochs 100 --batch_size 16
 """
 import os, sys, math, argparse, logging
 from datetime import datetime
@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
-from dataset_mask import ChangeMaskDataset
+from dataset_cd import ChangeMaskDataset
 from model.mask_branch.segformer_cd import SegformerCD
 
 CLASS_NAMES = {0: "background", 1: "road", 2: "building"}
